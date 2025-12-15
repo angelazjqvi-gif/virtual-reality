@@ -1,18 +1,18 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 using UnityEngine.UI;
+using UnityEngine.SceneManagement;
 
 public class BattleManager : MonoBehaviour
 {
-    public enum TurnState { PlayerTurn, EnemyTurn, Busy, End }
+    public enum TurnState { WaitingInput, Busy, End }
 
     [System.Serializable]
     public class PlayerSlot
     {
-        public BattleUnit unit;     // 该玩家 BattleUnit（必须 isPlayer=true）
-        public Button attackButton; // 该玩家攻击按钮（可为空：为空则不显示/不可点击）
+        public BattleUnit unit;
+        public Button attackButton;
     }
 
     [Header("Players (N)")]
@@ -21,7 +21,10 @@ public class BattleManager : MonoBehaviour
     [Header("Enemies (N)")]
     public List<BattleUnit> enemies = new List<BattleUnit>();
 
-    [Header("Enemy Turn")]
+    [Header("UI Overlay")]
+    public BattleUIOverlay uiOverlay;
+
+    [Header("Enemy Timing")]
     public float enemyDelayBeforeAttack = 0.4f;
 
     [Header("FX fallback")]
@@ -36,75 +39,86 @@ public class BattleManager : MonoBehaviour
     [Header("Scene Names")]
     public string worldSceneName = "world1";
 
-    [Header("Target Select")]
-    public bool separateTargetPerPlayer = false; // false=全队共用一个选中目标；true=每个玩家单独目标
+    [Header("Damage Popup (TMP UI)")]
+    public DamagePopup damagePopupPrefab;
+    public Canvas popupCanvas;
+    public Camera worldCamera;
+    public Vector3 popupWorldOffset = new Vector3(0f, 1.2f, 0f);
 
-    private TurnState state = TurnState.PlayerTurn;
+    [Header("Watchdog (Anti-freeze)")]
+    public float busyTimeout = 5f;   // ✅ Busy 超时自动推进，彻底杜绝卡死
+    private float busyTimer = 0f;
 
-    // 每个玩家本回合是否已行动
-    private List<bool> acted = new List<bool>();
+    private TurnState state = TurnState.WaitingInput;
 
-    // 选中目标：共用 or 每人一个
-    private BattleUnit sharedSelectedTarget = null;
-    private List<BattleUnit> perPlayerSelectedTarget = new List<BattleUnit>();
+    private BattleUnit selectedEnemyTarget = null;
+
+    private readonly List<BattleUnit> allUnits = new List<BattleUnit>();
+    private readonly List<BattleUnit> speedQueue = new List<BattleUnit>();
+    private int queueIndex = 0;
+    private BattleUnit currentActor = null;
+
+    // 当前行动者锁定的目标（动画事件/特效用）
+    private readonly Dictionary<BattleUnit, BattleUnit> lockedTargetForThisAction = new Dictionary<BattleUnit, BattleUnit>();
+
+    struct DamageResult
+    {
+        public int dmg;
+        public bool crit;
+    }
 
     void Start()
     {
-        RebuildRuntimeLists();
-        BindButtons();
-        StartNewPlayerPhase();
-        SetState(TurnState.PlayerTurn);
+        if (worldCamera == null) worldCamera = Camera.main;
+
+        BindPlayerButtons();
+        RebuildAllUnits();
+        BuildSpeedQueueNewRound();
+        AdvanceToNextActor();
     }
 
-    void RebuildRuntimeLists()
+    void Update()
     {
-        acted = new List<bool>(players.Count);
-        perPlayerSelectedTarget = new List<BattleUnit>(players.Count);
-
-        for (int i = 0; i < players.Count; i++)
+        // ✅ Busy 看门狗：任何原因导致 Busy 不退出，都强制推进
+        if (state == TurnState.Busy)
         {
-            acted.Add(false);
-            perPlayerSelectedTarget.Add(null);
+            busyTimer += Time.deltaTime;
+            if (busyTimer > busyTimeout)
+            {
+                Debug.LogWarning("[WATCHDOG] Busy timeout -> force next turn");
+                busyTimer = 0f;
+
+                // 强制推进：跳过当前卡住的动作
+                queueIndex++;
+                AdvanceToNextActor();
+            }
+        }
+        else
+        {
+            busyTimer = 0f;
         }
     }
 
-    void BindButtons()
+    void BindPlayerButtons()
     {
         for (int i = 0; i < players.Count; i++)
         {
             int idx = i;
-            var btn = players[i].attackButton;
-            if (btn == null) continue;
+            if (players[i].attackButton == null) continue;
 
-            btn.onClick.RemoveAllListeners();
-            btn.onClick.AddListener(() => OnClickPlayerAttack(idx));
+            players[i].attackButton.onClick.RemoveAllListeners();
+            players[i].attackButton.onClick.AddListener(() => OnClickAttack(idx));
         }
     }
 
-    void StartNewPlayerPhase()
+    void RebuildAllUnits()
     {
-        for (int i = 0; i < acted.Count; i++) acted[i] = false;
-        RefreshButtons();
-    }
-
-    void SetState(TurnState s)
-    {
-        state = s;
-        RefreshButtons();
-    }
-
-    void RefreshButtons()
-    {
-        bool canClick = (state == TurnState.PlayerTurn);
-
+        allUnits.Clear();
         for (int i = 0; i < players.Count; i++)
-        {
-            var slot = players[i];
-            if (slot.attackButton == null) continue;
+            if (players[i].unit != null) allUnits.Add(players[i].unit);
 
-            bool alive = IsAlive(slot.unit);
-            slot.attackButton.interactable = canClick && alive && !acted[i];
-        }
+        for (int i = 0; i < enemies.Count; i++)
+            if (enemies[i] != null) allUnits.Add(enemies[i]);
     }
 
     bool IsAlive(BattleUnit u)
@@ -112,227 +126,255 @@ public class BattleManager : MonoBehaviour
         return u != null && u.gameObject.activeInHierarchy && !u.IsDead();
     }
 
-    bool IsEnemyAlive(BattleUnit e)
+    void BuildSpeedQueueNewRound()
     {
-        return e != null && e.gameObject.activeInHierarchy && !e.IsDead();
+        speedQueue.Clear();
+        for (int i = 0; i < allUnits.Count; i++)
+        {
+            var u = allUnits[i];
+            if (IsAlive(u)) speedQueue.Add(u);
+        }
+
+        // SPD 降序；SPD 相同则随机打散一点
+        speedQueue.Sort((a, b) =>
+        {
+            int cmp = b.spd.CompareTo(a.spd);
+            if (cmp != 0) return cmp;
+            return Random.Range(-1, 2);
+        });
+
+        queueIndex = 0;
+        RefreshUI();
     }
 
-    // =========================
-    // ✅ 点敌人选目标（共用）
-    // =========================
+    void RefreshUI()
+    {
+        if (uiOverlay != null)
+            uiOverlay.Render(speedQueue, queueIndex, allUnits);
+
+        RefreshButtons();
+    }
+
+    void RefreshButtons()
+    {
+        for (int i = 0; i < players.Count; i++)
+        {
+            var btn = players[i].attackButton;
+            if (btn == null) continue;
+
+            bool isMyTurn =
+                (state == TurnState.WaitingInput) &&
+                (currentActor != null) &&
+                (players[i].unit == currentActor) &&
+                IsAlive(players[i].unit);
+
+            btn.interactable = isMyTurn;
+        }
+    }
+
     public void SelectEnemyTarget(BattleUnit enemy)
     {
         if (enemy == null) return;
-        if (!IsEnemyAlive(enemy)) return;
-        if (state != TurnState.PlayerTurn) return;
+        if (!IsAlive(enemy)) return;
+        if (enemy.isPlayer) return;
 
-        sharedSelectedTarget = enemy;
-
-        if (!separateTargetPerPlayer)
-        {
-            // 共用时不需要额外处理
-        }
+        selectedEnemyTarget = enemy;
+        Debug.Log($"Selected Target => {enemy.name}");
     }
 
-    // =========================
-    // ✅ 点敌人选目标（指定某玩家）
-    // EnemySelectable 也可以用这个（传 who）
-    // =========================
-    public void SelectEnemyTarget(BattleUnit enemy, int who)
+    void AdvanceToNextActor()
     {
-        if (enemy == null) return;
-        if (!IsEnemyAlive(enemy)) return;
-        if (state != TurnState.PlayerTurn) return;
+        if (state == TurnState.End) return;
 
-        if (!separateTargetPerPlayer)
+        // 胜负判断
+        if (AllEnemiesDead())
         {
-            sharedSelectedTarget = enemy;
+            StartCoroutine(EndBattleAndReturn(true));
+            return;
+        }
+        if (AllPlayersDead())
+        {
+            StartCoroutine(EndBattleAndReturn(false));
             return;
         }
 
-        if (who < 0 || who >= players.Count) return;
-        perPlayerSelectedTarget[who] = enemy;
-    }
+        // 新一轮
+        if (queueIndex >= speedQueue.Count)
+            BuildSpeedQueueNewRound();
 
-    void ClearSelectedIfInvalid()
-    {
-        if (sharedSelectedTarget != null && !IsEnemyAlive(sharedSelectedTarget))
-            sharedSelectedTarget = null;
+        // 跳过已死
+        while (queueIndex < speedQueue.Count && !IsAlive(speedQueue[queueIndex]))
+            queueIndex++;
 
-        for (int i = 0; i < perPlayerSelectedTarget.Count; i++)
+        if (queueIndex >= speedQueue.Count)
         {
-            var t = perPlayerSelectedTarget[i];
-            if (t != null && !IsEnemyAlive(t)) perPlayerSelectedTarget[i] = null;
-        }
-    }
-
-    BattleUnit ResolvePlayerTarget(int who)
-    {
-        ClearSelectedIfInvalid();
-
-        BattleUnit selected = null;
-
-        if (!separateTargetPerPlayer)
-        {
-            selected = sharedSelectedTarget;
-        }
-        else
-        {
-            if (who >= 0 && who < perPlayerSelectedTarget.Count)
-                selected = perPlayerSelectedTarget[who];
+            BuildSpeedQueueNewRound();
+            return;
         }
 
-        if (IsEnemyAlive(selected)) return selected;
+        currentActor = speedQueue[queueIndex];
+        Debug.Log($"[TURN] idx={queueIndex}/{speedQueue.Count} next={currentActor.name} isPlayer={currentActor.isPlayer}");
 
-        // 没选/选的死了：回退到第一个存活敌人
-        return GetFirstAliveEnemy();
-    }
-
-    void OnClickPlayerAttack(int who)
-    {
-        if (state != TurnState.PlayerTurn) return;
-        if (who < 0 || who >= players.Count) return;
-
-        var attacker = players[who].unit;
-        if (!IsAlive(attacker) || acted[who]) return;
-
-        StartCoroutine(PlayerAttackFlow(who));
-    }
-
-    IEnumerator PlayerAttackFlow(int who)
-    {
-        SetState(TurnState.Busy);
-
-        var attacker = players[who].unit;
-        if (!IsAlive(attacker))
+        // ✅ 核心修复：轮到玩家时强制回 WaitingInput（杜绝 boss 死后 Busy 残留）
+        if (currentActor.isPlayer)
         {
-            // 这个玩家已经死了，直接当他行动结束
-            acted[who] = true;
-            if (AllPlayersActedOrDead()) StartCoroutine(EnemyTeamAttackFlow());
-            else SetState(TurnState.PlayerTurn);
-            yield break;
+            state = TurnState.WaitingInput;
+
+            // 选中的敌人如果死了，清掉
+            if (selectedEnemyTarget != null && !IsAlive(selectedEnemyTarget))
+                selectedEnemyTarget = null;
+
+            RefreshUI();
+            return;
         }
 
-        BattleUnit target = ResolvePlayerTarget(who);
+        // 敌人自动行动
+        state = TurnState.Busy;
+        RefreshUI();
+        StartCoroutine(EnemyAutoAttackFlow(currentActor));
+    }
+
+    void OnClickAttack(int playerIndex)
+    {
+        if (state != TurnState.WaitingInput) return;
+        if (playerIndex < 0 || playerIndex >= players.Count) return;
+
+        BattleUnit attacker = players[playerIndex].unit;
+        if (attacker == null || attacker != currentActor) return;
+
+        StartCoroutine(PlayerAttackFlow(attacker));
+    }
+
+    IEnumerator PlayerAttackFlow(BattleUnit attacker)
+    {
+        state = TurnState.Busy;
+        RefreshUI();
+
+        BattleUnit target =
+            (IsAlive(selectedEnemyTarget) && !selectedEnemyTarget.isPlayer)
+            ? selectedEnemyTarget
+            : GetFirstAliveEnemy();
+
         if (target == null)
         {
-            yield return EndBattleAndReturn(playerWin: true);
+            yield return EndBattleAndReturn(true);
             yield break;
         }
 
-        // ✅ 触发攻击动画（动画事件里会调用 SpawnAttackFxNow）
-        attacker.TriggerAttack(); // :contentReference[oaicite:1]{index=1}
+        lockedTargetForThisAction[attacker] = target;
 
-        // ✅ 等攻击动画播完再扣血（保持你原逻辑）
+        attacker.TriggerAttack();
         yield return WaitAttackFinish(attacker);
 
-        target.TakeDamage(attacker.atk); // :contentReference[oaicite:2]{index=2}
+        var r = ComputeDamage(attacker, target);
+        target.TakeDamage(r.dmg);
+        SpawnDamagePopup(target, r.dmg, r.crit);
 
         if (target.IsDead())
         {
-            // 目标死亡清理选中（避免还指向它）
-            if (sharedSelectedTarget == target) sharedSelectedTarget = null;
-            for (int i = 0; i < perPlayerSelectedTarget.Count; i++)
-                if (perPlayerSelectedTarget[i] == target) perPlayerSelectedTarget[i] = null;
-
             yield return PlayDeathAndRemove(target);
         }
 
         if (AllEnemiesDead())
         {
-            yield return EndBattleAndReturn(playerWin: true);
+            yield return EndBattleAndReturn(true);
             yield break;
         }
 
-        acted[who] = true;
-
-        if (AllPlayersActedOrDead())
-            StartCoroutine(EnemyTeamAttackFlow());
-        else
-            SetState(TurnState.PlayerTurn);
+        queueIndex++;
+        AdvanceToNextActor();
     }
 
-    bool AllPlayersActedOrDead()
+    IEnumerator EnemyAutoAttackFlow(BattleUnit enemy)
     {
-        for (int i = 0; i < players.Count; i++)
+        yield return new WaitForSeconds(enemyDelayBeforeAttack);
+
+        BattleUnit target = PickAlivePlayer();
+        if (target == null)
         {
-            bool done = acted[i] || !IsAlive(players[i].unit);
-            if (!done) return false;
-        }
-        return true;
-    }
-
-    IEnumerator EnemyTeamAttackFlow()
-    {
-        SetState(TurnState.Busy);
-
-        for (int i = 0; i < enemies.Count; i++)
-        {
-            var e = enemies[i];
-            if (!IsEnemyAlive(e)) continue;
-
-            yield return new WaitForSeconds(enemyDelayBeforeAttack);
-
-            BattleUnit targetPlayer = PickAlivePlayer();
-            if (targetPlayer == null)
-            {
-                yield return EndBattleAndReturn(playerWin: false);
-                yield break;
-            }
-
-            e.TriggerAttack();
-            yield return WaitAttackFinish(e);
-
-            targetPlayer.TakeDamage(e.atk);
-
-            if (targetPlayer.IsDead())
-                yield return PlayDeathAndRemove(targetPlayer);
-
-            if (AllPlayersDead())
-            {
-                yield return EndBattleAndReturn(playerWin: false);
-                yield break;
-            }
+            yield return EndBattleAndReturn(false);
+            yield break;
         }
 
-        StartNewPlayerPhase();
-        SetState(TurnState.PlayerTurn);
+        lockedTargetForThisAction[enemy] = target;
+
+        enemy.TriggerAttack();
+        yield return WaitAttackFinish(enemy);
+
+        var r = ComputeDamage(enemy, target);
+        target.TakeDamage(r.dmg);
+        SpawnDamagePopup(target, r.dmg, r.crit);
+
+        if (target.IsDead())
+        {
+            yield return PlayDeathAndRemove(target);
+        }
+
+        if (AllPlayersDead())
+        {
+            yield return EndBattleAndReturn(false);
+            yield break;
+        }
+
+        queueIndex++;
+        AdvanceToNextActor();
     }
 
-    // =========================================================
-    // ✅ Animation Event 调用：在“挥刀那一帧”生成特效
-    //    玩家：打到该玩家 ResolvePlayerTarget(who) 的受击点
-    // =========================================================
+    DamageResult ComputeDamage(BattleUnit attacker, BattleUnit target)
+    {
+        int baseDmg = attacker.atk - target.def;
+        if (baseDmg < 1) baseDmg = 1;
+
+        bool crit = (Random.value < Mathf.Clamp01(attacker.cr));
+        float mul = crit ? Mathf.Max(1f, attacker.cd) : 1f;
+
+        int dmg = Mathf.RoundToInt(baseDmg * mul);
+        if (dmg < 1) dmg = 1;
+
+        return new DamageResult { dmg = dmg, crit = crit };
+    }
+
+    void SpawnDamagePopup(BattleUnit target, int damage, bool crit)
+    {
+        if (damagePopupPrefab == null) return;
+        if (popupCanvas == null) return;
+        if (worldCamera == null) worldCamera = Camera.main;
+        if (target == null) return;
+
+        Vector3 worldPos = target.transform.position + popupWorldOffset;
+        Vector3 screenPos = worldCamera.WorldToScreenPoint(worldPos);
+        if (screenPos.z < 0) return;
+
+        DamagePopup popup = Instantiate(damagePopupPrefab, popupCanvas.transform);
+        RectTransform rt = popup.GetComponent<RectTransform>();
+        rt.position = screenPos;
+
+        popup.Setup(damage, crit);
+    }
+
+    // Animation Event 调用：攻击某一帧生成特效
     public void SpawnAttackFxNow(BattleUnit attacker)
     {
-        if (attacker == null) return;
+        if (attacker == null) return; // ✅ 防空：避免 boss 特殊事件传空导致中断
 
-        Transform hit = null;
-
-        if (attacker.isPlayer)
+        if (!lockedTargetForThisAction.TryGetValue(attacker, out var target) || target == null || !IsAlive(target))
         {
-            int who = FindPlayerIndex(attacker);
-
-            // 找不到就按共用目标兜底
-            BattleUnit target = (who >= 0) ? ResolvePlayerTarget(who) : GetFirstAliveEnemy();
-            if (target != null) hit = (target.hitPoint != null) ? target.hitPoint : target.transform;
+            target = attacker.isPlayer ? GetFirstAliveEnemy() : PickAlivePlayer();
         }
-        else
-        {
-            var target = PickAlivePlayer();
-            if (target != null) hit = (target.hitPoint != null) ? target.hitPoint : target.transform;
-        }
+        if (target == null) return;
 
-        if (hit == null) return;
-
+        Transform hit = target.hitPoint != null ? target.hitPoint : target.transform;
         StartCoroutine(PlayFxAndWait(attacker.attackFxPrefab, hit));
     }
 
-    int FindPlayerIndex(BattleUnit u)
+    BattleUnit GetFirstAliveEnemy()
     {
-        for (int i = 0; i < players.Count; i++)
-            if (players[i].unit == u) return i;
-        return -1;
+        for (int i = 0; i < enemies.Count; i++)
+        {
+            var e = enemies[i];
+            if (IsAlive(e)) return e;
+        }
+        return null;
     }
 
     BattleUnit PickAlivePlayer()
@@ -347,23 +389,10 @@ public class BattleManager : MonoBehaviour
         return alive[Random.Range(0, alive.Count)];
     }
 
-    BattleUnit GetFirstAliveEnemy()
-    {
-        for (int i = 0; i < enemies.Count; i++)
-        {
-            var e = enemies[i];
-            if (IsEnemyAlive(e)) return e;
-        }
-        return null;
-    }
-
     bool AllEnemiesDead()
     {
         for (int i = 0; i < enemies.Count; i++)
-        {
-            var e = enemies[i];
-            if (IsEnemyAlive(e)) return false;
-        }
+            if (IsAlive(enemies[i])) return false;
         return true;
     }
 
@@ -378,27 +407,18 @@ public class BattleManager : MonoBehaviour
     {
         state = TurnState.End;
         RefreshButtons();
-
-        if (GameSession.I != null)
-        {
-            if (playerWin) GameSession.I.EndBattle_PlayerWin();
-            else GameSession.I.EndBattle_PlayerLose();
-        }
-
         yield return new WaitForSeconds(0.15f);
         SceneManager.LoadScene(worldSceneName);
     }
 
-    // ======================================================
-    // ✅ 等攻击结束（不触发Attack，只负责等待）
-    // ======================================================
     IEnumerator WaitAttackFinish(BattleUnit unit)
     {
         if (unit == null || unit.animator == null) yield break;
         if (string.IsNullOrEmpty(unit.attackStateName)) yield break;
 
-        yield return null; // 给 Animator 1 帧切状态
+        yield return null;
 
+        // 进入攻击状态
         float t = 0f;
         while (!unit.animator.GetCurrentAnimatorStateInfo(0).IsName(unit.attackStateName) && t < maxWaitEnterAttack)
         {
@@ -409,6 +429,7 @@ public class BattleManager : MonoBehaviour
         if (!unit.animator.GetCurrentAnimatorStateInfo(0).IsName(unit.attackStateName))
             yield break;
 
+        // 等攻击状态结束（兜底超时）
         float t2 = 0f;
         while (unit.animator.GetCurrentAnimatorStateInfo(0).IsName(unit.attackStateName) && t2 < maxWaitAttackTotal)
         {
@@ -452,12 +473,14 @@ public class BattleManager : MonoBehaviour
         Destroy(fx);
     }
 
+    // ✅ 关键：死亡流程永不卡死（boss loop / stateName 不匹配 / Animator 异常都兜底）
     IEnumerator PlayDeathAndRemove(BattleUnit unit)
     {
         if (unit == null) yield break;
 
         if (unit.animator == null || string.IsNullOrEmpty(unit.deathStateName))
         {
+            CleanupDeadTargetRefs(unit);
             unit.HideOrDestroy();
             yield break;
         }
@@ -465,28 +488,53 @@ public class BattleManager : MonoBehaviour
         unit.TriggerDie();
         yield return null;
 
-        float tEnter = 0f;
-        while (!unit.animator.GetCurrentAnimatorStateInfo(0).IsName(unit.deathStateName) && tEnter < 0.5f)
+        // 等进入死亡状态（最多0.5秒）
+        float enter = 0f;
+        while (enter < 0.5f)
         {
-            tEnter += Time.deltaTime;
+            if (unit == null) yield break;
+            var st = unit.animator.GetCurrentAnimatorStateInfo(0);
+            if (st.IsName(unit.deathStateName)) break;
+            enter += Time.deltaTime;
             yield return null;
         }
 
-        if (!unit.animator.GetCurrentAnimatorStateInfo(0).IsName(unit.deathStateName))
-        {
-            unit.HideOrDestroy();
-            yield break;
-        }
-
+        // 等死亡播完（最多 maxWaitDeath 秒），即使 loop/填错也会退出
         float t = 0f;
         while (t < maxWaitDeath)
         {
+            if (unit == null) yield break;
+
             var st = unit.animator.GetCurrentAnimatorStateInfo(0);
-            if (!st.loop && st.normalizedTime >= 1f) break;
+
+            // 没在死亡状态就别卡着
+            if (!st.IsName(unit.deathStateName))
+                break;
+
+            // 非循环播完就结束
+            if (!st.loop && st.normalizedTime >= 1f)
+                break;
+
             t += Time.deltaTime;
             yield return null;
         }
 
+        CleanupDeadTargetRefs(unit);
         unit.HideOrDestroy();
+    }
+
+    void CleanupDeadTargetRefs(BattleUnit dead)
+    {
+        if (dead == null) return;
+
+        if (selectedEnemyTarget == dead)
+            selectedEnemyTarget = null;
+
+        var keys = new List<BattleUnit>(lockedTargetForThisAction.Keys);
+        foreach (var k in keys)
+        {
+            if (lockedTargetForThisAction.TryGetValue(k, out var tar) && tar == dead)
+                lockedTargetForThisAction.Remove(k);
+        }
     }
 }
